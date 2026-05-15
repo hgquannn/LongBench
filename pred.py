@@ -28,44 +28,77 @@ def query_llm(prompt, model, tokenizer, client=None, temperature=0.5, max_new_to
         if len(input_ids) > max_len:
             input_ids = input_ids[:max_len//2] + input_ids[-max_len//2:]
             prompt = tokenizer.decode(input_ids, skip_special_tokens=True)
+        else:
+            print(f"[INFO] Prompt length: {len(input_ids)} tokens.")
     else:
         input_ids = tokenizer.encode(prompt, disallowed_special=())
         if len(input_ids) > max_len:
             input_ids = input_ids[:max_len//2] + input_ids[-max_len//2:]
             prompt = tokenizer.decode(input_ids)
     tries = 0
-    if model in model_map:
-        model = model_map[model]
+    current_max_tokens = max_new_tokens
+    actual_model_name = model_map.get(model, model)
+    
     while tries < 5:
         tries += 1
         try:
             completion = client.chat.completions.create(
-                model=model,
+                model=actual_model_name,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=temperature,
-                max_tokens=max_new_tokens,
+                top_p=0.95,
+                max_tokens=current_max_tokens,
+                extra_body={"top_k": 40},
             )
-            return completion.choices[0].message.content
+            
+            message = completion.choices[0].message
+            content = message.content
+            
+            if content is None:
+                content = getattr(message, 'reasoning_content', None) or ''
+            
+            return content
+
         except KeyboardInterrupt as e:
             raise e
         except Exception as e:
-            print("Error Occurs: \"%s\"        Retry ..."%(str(e)))
+            error_str = str(e)
+            
+            if "timed out" in error_str.lower():
+                print("continue due to timeout")
+                continue
+                current_max_tokens //= 2
+                print(f"Error: Request timed out. Reducing tokens to {current_max_tokens} and retrying (Try {tries}/5)...")
+            else:
+                print(f"Error Occurs: \"{error_str}\" Retry (Try {tries}/5) ...")
+            
+            if current_max_tokens < 1:
+                break
+                
             time.sleep(1)
-    else:
-        print("Max tries. Failed.")
-        return ''
+            
+    print("Max tries reached. Failed.")
+    return ''
 
+import re
 def extract_answer(response):
-    response = response.replace('*', '')
-    match = re.search(r'The correct answer is \(([A-D])\)', response)
+    # Remove markdown formatting like **A**
+    clean_response = response.replace('*', '')
+    
+    # Look for "Correct Answer" or "The correct answer is" 
+    # followed by optional punctuation/space and a single letter A-D
+    # Pattern explanation:
+    # (?i)        : Case-insensitive
+    # \b[A-D]\b   : Matches A, B, C, or D as a whole word
+    match = re.search(r'(?:correct answer is|answer:?)\s*\(?([A-D])\)?', clean_response, re.IGNORECASE)
+    
     if match:
-        return match.group(1)
-    else:
-        match = re.search(r'The correct answer is ([A-D])', response)
-        if match:
-            return match.group(1)
-        else:
-            return None
+        return match.group(1).upper()
+    
+    # Fallback: Just find the last capitalized A, B, C, or D in the string 
+    # if the specific phrase isn't found.
+    fallback = re.findall(r'\b([A-D])\b', clean_response)
+    return fallback[-1] if fallback else None
 
 def get_pred(data, args, fout):
     model = args.model
@@ -91,17 +124,31 @@ def get_pred(data, args, fout):
         else:
             template = template_0shot
         prompt = template.replace('$DOC$', context.strip()).replace('$Q$', item['question'].strip()).replace('$C_A$', item['choice_A'].strip()).replace('$C_B$', item['choice_B'].strip()).replace('$C_C$', item['choice_C'].strip()).replace('$C_D$', item['choice_D'].strip())
+        # item['prompt'] = prompt
+
+        # if model in model_map:
+        #     prompt_ids = tokenizer.encode(prompt)
+        # else:
+        #     prompt_ids = tokenizer.encode(prompt, disallowed_special=())
+        # if len(prompt_ids) < 128000:
+        #     print(f"[SKIP] Item {item['_id']}: prompt ({len(prompt_ids)} tokens < 128000).")
+        #     continue
+        
+        # if item["length"] != "short":
+            # print("continue")
+            # continue
+        
         if args.cot:
-            output = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=1024)
+            output = query_llm(prompt, model, tokenizer, client, temperature=1.0, max_new_tokens=16384)
         else:
-            output = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=128)
+            output = query_llm(prompt, model, tokenizer, client, temperature=1.0, max_new_tokens=16384)
         if output == '':
             continue
         if args.cot: # extract answer
             response = output.strip()
             item['response_cot'] = response
             prompt = template_0shot_cot_ans.replace('$DOC$', context.strip()).replace('$Q$', item['question'].strip()).replace('$C_A$', item['choice_A'].strip()).replace('$C_B$', item['choice_B'].strip()).replace('$C_C$', item['choice_C'].strip()).replace('$C_D$', item['choice_D'].strip()).replace('$COT$', response)
-            output = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=128)
+            output = query_llm(prompt, model, tokenizer, client, temperature=1.0, max_new_tokens=128)
             if output == '':
                 continue
         response = output.strip()
@@ -111,6 +158,10 @@ def get_pred(data, args, fout):
         item['context'] = context[:1000]
         fout.write(json.dumps(item, ensure_ascii=False) + '\n')
         fout.flush()
+
+        # if item["length"] == "short":
+        #     print("breaking")
+        #     break
 
 def main():
     os.makedirs(args.save_dir, exist_ok=True)
@@ -133,10 +184,13 @@ def main():
         with open(out_file, encoding='utf-8') as f:
             has_data = {json.loads(line)["_id"]: 0 for line in f}
     fout = open(out_file, 'a', encoding='utf-8')
-    data = []
-    for item in data_all:
-        if item["_id"] not in has_data:
-            data.append(item)
+    data = data_all
+    # for item in data_all:
+    #     if item["_id"] not in has_data:
+    #         data.append(item)
+
+    # length_order = {"short": 0, "medium": 1, "long": 2}
+    # data.sort(key=lambda x: length_order.get(x["length"], 3))
 
     data_subsets = [data[i::args.n_proc] for i in range(args.n_proc)]
     processes = []
@@ -150,10 +204,11 @@ def main():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--save_dir", "-s", type=str, default="results")
-    parser.add_argument("--model", "-m", type=str, default="GLM-4-9B-Chat")
+    parser.add_argument("--model", "-m", type=str, default="GLM-5-FP8")
     parser.add_argument("--cot", "-cot", action='store_true') # set to True if using COT
     parser.add_argument("--no_context", "-nc", action='store_true') # set to True if using no context (directly measuring memorization)
     parser.add_argument("--rag", "-rag", type=int, default=0) # set to 0 if RAG is not used, otherwise set to N when using top-N retrieved context
-    parser.add_argument("--n_proc", "-n", type=int, default=16)
+    parser.add_argument("--n_proc", "-n", type=int, default=1)
+    parser.add_argument("--limit", "-l", type=int, default=0, help="Limit number of samples to process (0 = no limit)")
     args = parser.parse_args()
     main()
